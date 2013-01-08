@@ -4,7 +4,7 @@ Attribute VB_Name = "mp_extsimp1"
 ' Generalization of complex junctions and two ways roads
 ' from OpenStreetMap data
 '
-' Copyright © 2012 OverQuantum
+' Copyright © 2012-2013 OverQuantum
 '
 ' This program is free software: you can redistribute it and/or modify
 ' it under the terms of the GNU General Public License as published by
@@ -75,6 +75,7 @@ Attribute VB_Name = "mp_extsimp1"
 '2012.11.19 - added keeping header of source file, removed writing "; roadtype="
 '2012.11.15-20 - adding explaining comments, small fixes
 '2012.11.20 - added license and references
+'2013.01.08 - added CollapseShortEdges (fix "too close nodes")
 
 'TODO:
 '*? dump problems of OSM data (1: too long links, 2: ?)
@@ -3877,6 +3878,37 @@ lRealloc:
     End If
 End Function
 
+
+'Collapse all edges shorter than CollapseDistance (also will kill void edges)
+'Will collapse edges one by one, so should be called somewhere in the end of optimization
+Public Sub CollapseShortEdges(CollapseDistance As Double)
+    Dim i As Long, j As Long, k As Long
+    Dim somedeleted As Long
+    Dim EdgeLen As Double
+
+lIteration:
+    somedeleted = 0
+    For i = 0 To EdgesNum - 1
+        If Edges(i).node1 >= 0 Then
+            EdgeLen = Distance(Edges(i).node1, Edges(i).node2)
+            If EdgeLen < CollapseDistance Then
+                j = Edges(i).node1
+                k = Edges(i).node2
+                Call DelEdge(i) 'del this edge
+                If j <> k Then Call MergeNodes(j, k, 0) 'merge nodes, only if they are different
+                somedeleted = 1
+            End If
+        End If
+        If (i And 8191) = 0 Then
+            'show progress
+            Form1.Caption = "CSE " + CStr(i) + " / " + CStr(EdgesNum): Form1.Refresh
+        End If
+    Next
+    If somedeleted > 0 Then GoTo lIteration
+End Sub
+
+
+
 'Start point
 Public Sub OptimizeRouting(InputFile As String)
     Dim OutFile As String
@@ -3945,6 +3977,11 @@ Public Sub OptimizeRouting(InputFile As String)
     'Optimize all roads by (Ramer–)Douglas–Peucker algorithm
     Call DouglasPeucker_total(5)
     'Epsilon = 5 metres
+    DoEvents
+    
+    'Remove very short edges, they are errors, most probably
+    Call CollapseShortEdges(3)
+    'CollapseDistance = 3 metres
     DoEvents
     
     'Save result
