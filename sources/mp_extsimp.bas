@@ -76,6 +76,7 @@ Attribute VB_Name = "mp_extsimp1"
 '2012.11.15-20 - adding explaining comments, small fixes
 '2012.11.20 - added license and references
 '2013.01.08 - added CollapseShortEdges (fix "too close nodes")
+'2013.01.28 - fixed deadlock in SaveChain in case of isolated road cycle
 
 'TODO:
 '*? dump problems of OSM data (1: too long links, 2: ?)
@@ -893,6 +894,7 @@ Public Sub SaveChain(edge1 As Long)
     Dim refedge As edge
     Dim ChainEnd As Long
     Dim NextChainEdge As Long
+    Dim startnode As Long
     
     Dim k1 As Long, k2 As Long
     Dim typ As Long
@@ -911,6 +913,8 @@ Public Sub SaveChain(edge1 As Long)
     
     i = Edges(edge1).node1 'start node
     j = Edges(edge1).node2
+    
+    startnode = j
     
     If Nodes(i).Edges <> 2 Then
         'i is end of chain
@@ -934,7 +938,7 @@ Public Sub SaveChain(edge1 As Long)
     
 lGoNext:
     k = GoByChain(i, j) 'go by chain
-    If Nodes(k).Edges = 2 Then j = i: i = k: GoTo lGoNext 'if still 2 edges - proceed
+    If Nodes(k).Edges = 2 And k <> startnode Then j = i: i = k: GoTo lGoNext 'if still 2 edges and we have not found loop - proceed
     
     '   *-----*-----*-----*---...
     '   k     i     j
@@ -949,6 +953,7 @@ lGoNext:
     ChainNum = 0
     Call AddChain(k)
     Call AddChain(i)
+    startnode = k
     
     'keep info about first edge in chain
     refedge = Edges(GoByChain_lastedge)
@@ -976,7 +981,7 @@ lGoNext2:
     
     Call AddChain(k)
     
-    If Nodes(k).Edges = 2 Then
+    If Nodes(k).Edges = 2 And k <> startnode Then
         'still 2 edges - still chain
         j = i
         i = k
