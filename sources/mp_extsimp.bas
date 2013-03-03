@@ -79,6 +79,7 @@ Attribute VB_Name = "mp_extsimp1"
 '2013.01.28 - fixed deadlock in SaveChain in case of isolated road cycle
 '2013.02.28 - added MaxLinkLen to Load_MP()
 '2013.03.02 - fixed bug in output degrees<0.1, added LATLON_FORMAT
+'2013.03.03 - fixed bug in removing _link on exceeding MaxLinkLen
 
 'TODO:
 '*? dump problems of OSM data (1: too long links (ready), 2: ?)
@@ -1793,6 +1794,7 @@ lNextPoint:
                     LinkLen = LinkLen + Distance(NodesNum - 1, NodesNum)
                     If LinkLen > MaxLinkLen Then
                         WayClass = WayClass And HIGHWAY_MASK_MAIN
+                        Edges(j).roadtype = WayClass
                         For i = 0 To ChainNum - 1
                             Edges(Chain(i)).roadtype = WayClass
                         Next
