@@ -3,6 +3,7 @@ Attribute VB_Name = "mp_extsimp1"
 ' mp_extsimp
 ' Generalization of complex junctions and two ways roads
 ' from OpenStreetMap data
+' Also a toolbox for other generalization procedures
 '
 ' Copyright © 2012-2013 OverQuantum
 '
@@ -81,14 +82,32 @@ Attribute VB_Name = "mp_extsimp1"
 '2013.03.02 - fixed bug in output degrees<0.1, added LATLON_FORMAT
 '2013.03.03 - fixed bug in removing _link on exceeding MaxLinkLen
 
+'2013-09-30 - fixed bug in GetNodeInBboxByCluster on bbox were out of clustered bbox
+'2013-09-30 - added consts FORCEWAYSPEED, TRUNK_TYPE, TRUNK_LINK_TYPE and LOAD_NOROUTING
+'2013-10-01 - fixed deadlock in DouglasPeucker_chain and _split on isolated two-road cycle
+'2013-10-01 - changed form1 to use Form_Load, now program can be run minimized (ex. using "start /MIN")
+'2013-10-01 - added JoinCloseNodes(), CombineDuplicateEdgesAll() and RemoveOneWay()
+'2013-10-02 - changed edge() to dynamic array
+'2013-10-02 - changed realloc of Nodes and Edges to +1M after 1M
+'2013-10-02 - added loading of mp Type field, controlled by const LOAD_TYPE
+'2013-10-02 - added loading of polygons
+'2013-10-02 - fixed ExpandBbox for beyond +-89 degrees
+'2013-10-03 - fixed loading of mp Type if no comments
+'2013-10-05 - added loading and saving of lined OSM file
+'2013-10-05 - added AddNodeToClusterIndex and sorting of nodes by ele
+'2013-10-08 - changed control consts to Control_* variables
+'2013-10-08 - added showing function params in form caption
+'2013-10-08 - added Control_TrunkLinkType
+'2013-10-08 - added TrimByBbox, FileLen_safe
+'2013-10-09 - added StitchNodes
+'2013-10-10 - commented and regression checked with 2013-03-03 version
+
+
 'TODO:
 '*? dump problems of OSM data (1: too long links (ready), 2: ?)
-'? 180/-180 safety
+'? 180/-180 safety (currently works fine with planet wide data, but could fail on parallel-wide
 
 Option Explicit
-
-'Cluster size in degrees for ClusterIndex build and search
-Public Const CLUSTER_SIZE = 0.05
 
 'Conversion degrees to radians and back
 Public Const DEGTORAD = 1.74532925199433E-02
@@ -146,8 +165,9 @@ Public Type node
     lat As Double 'Latitude
     lon As Double 'Longitude
     NodeID As Long 'NodeID from source .mp, -1 - not set, -2 - node killed
-    edge(20) As Long  'all edges (values - indexes in Edges array)
-    Edges As Long 'number of edges, -1 means "not counted"
+    edge() As Long  'all edges (values - indexes in Edges array)
+    Edges As Integer 'number of edges, -1 means "not counted"
+    EdgesAlloc As Integer 'allocated number of edges
     mark As Long 'internal marker for all-network algo-s
     temp_dist As Double 'internal value for for all-network algo-s
 End Type
@@ -248,17 +268,38 @@ Public TWalloc As Long
 Public TWforwNum As Long
 Public TWbackNum As Long
 
+'Control variables to adjust algorithms, works more like #ifdef
+Public Control_ClusterSize As Double 'Cluster size in degrees for ClusterIndex build and search. Dont change without rebuilding index
+Public Control_ForceWaySpeed As Long 'Force speed class for ways
+Public Control_TrunkType As Long     'MP type for saving highway=trunk
+Public Control_TrunkLinkType As Long 'MP type for saving highway=trunk_link
+Public Control_PrimaryType As Long   'MP type for saving highway=primary
+Public Control_LoadNoRoute As Long   'Load mp object without Route data
+Public Control_LoadMPType As Long    'Parse MP type during loading
+
 'Init - init all arrays
 Public Sub init()
+    
+    Control_ClusterSize = 0.05   '0.05 degrees for local maps, 1 for planet-s
+    Control_ForceWaySpeed = -1   'set -1 to not force, 0 or more to forcing this value
+    Control_TrunkType = 1        'set 1 to be have same as motorway
+    Control_PrimaryType = 2      'set 2 to use 0x02 Principal highway
+    Control_TrunkLinkType = 9    'set 9 to have same as motorway
+    Control_LoadNoRoute = 0      'set 0 to skip no-routing polylines, 1 to load
+    Control_LoadMPType = 0       'set 0 to skip mp Type= field, 1 to parse
+    
     NodesAlloc = 1000
     ReDim Nodes(NodesAlloc)
     NodesNum = 0
+    
+    Nodes(0).EdgesAlloc = 3
+    ReDim Nodes(0).edge(Nodes(0).EdgesAlloc)
     
     EdgesAlloc = 1000
     ReDim Edges(EdgesAlloc)
     EdgesNum = 0
 
-    ChainAlloc = 1000
+    ChainAlloc = 10000
     ReDim Chain(ChainAlloc)
     ChainNum = 0
     
@@ -282,10 +323,17 @@ End Sub
 Public Sub AddNode()
     If NodesNum >= NodesAlloc Then
         'realloc if needed
-        NodesAlloc = NodesAlloc * 2
+        If NodesAlloc >= 1000000 Then
+            NodesAlloc = NodesAlloc + 1000000
+        Else
+            NodesAlloc = NodesAlloc * 2
+        End If
         ReDim Preserve Nodes(NodesAlloc)
     End If
     NodesNum = NodesNum + 1
+    
+    Nodes(NodesNum).EdgesAlloc = 3
+    ReDim Nodes(NodesNum).edge(Nodes(NodesNum).EdgesAlloc)
 End Sub
 
 'Add one edge to dynamic array
@@ -293,7 +341,11 @@ End Sub
 Public Sub AddEdge()
     If EdgesNum >= EdgesAlloc Then
         'realloc if needed
-        EdgesAlloc = EdgesAlloc * 2
+        If EdgesAlloc >= 1000000 Then
+            EdgesAlloc = EdgesAlloc + 1000000
+        Else
+            EdgesAlloc = EdgesAlloc * 2
+        End If
         ReDim Preserve Edges(EdgesAlloc)
     End If
     EdgesNum = EdgesNum + 1
@@ -321,6 +373,20 @@ Public Sub AddChain(i As Long)
     ChainNum = ChainNum + 1
 End Sub
 
+
+Public Sub AddEdgeToNode(node1 As Long, edge1 As Long)
+    Dim k As Long
+    k = Nodes(node1).Edges
+    Nodes(node1).edge(k) = edge1
+    If Nodes(node1).Edges >= Nodes(node1).EdgesAlloc Then
+        'realloc if needed
+        Nodes(node1).EdgesAlloc = Nodes(node1).EdgesAlloc + 3
+        ReDim Preserve Nodes(node1).edge(Nodes(node1).EdgesAlloc)
+    End If
+    Nodes(node1).Edges = Nodes(node1).Edges + 1
+End Sub
+
+
 'Join two nodes by new edge
 'node1 - start node, 'node2 - end node
 'return: index of new edge
@@ -330,12 +396,14 @@ Public Function JoinByEdge(node1 As Long, node2 As Long) As Long
     Edges(EdgesNum).node2 = node2
     
     'add edge to both nodes
-    k = Nodes(node1).Edges
-    Nodes(node1).edge(k) = EdgesNum
-    Nodes(node1).Edges = Nodes(node1).Edges + 1
-    k = Nodes(node2).Edges
-    Nodes(node2).edge(k) = EdgesNum
-    Nodes(node2).Edges = Nodes(node2).Edges + 1
+    Call AddEdgeToNode(node1, EdgesNum)
+    Call AddEdgeToNode(node2, EdgesNum)
+    'k = Nodes(node1).Edges
+    'Nodes(node1).edge(k) = EdgesNum
+    'Nodes(node1).Edges = Nodes(node1).Edges + 1
+    'k = Nodes(node2).Edges
+    'Nodes(node2).edge(k) = EdgesNum
+    'Nodes(node2).Edges = Nodes(node2).Edges + 1
     JoinByEdge = EdgesNum
     Call AddEdge
 End Function
@@ -348,6 +416,9 @@ Public Sub JoinNodesByID()
     Dim MapNum As Long
     Dim IDmap() As Long
     Dim NodeMap() As Long
+    
+    'No data - do nothing
+    If NodeIDMax = -1 Then Exit Sub
     
     'if NodeID indexes are too big, we could not use direct mapping
     'max number for direct mapping should be selected with respect to available RAM
@@ -375,7 +446,7 @@ lSkip:
 
         If (i And 8191) = 0 Then
             'display progress
-            Form1.Caption = "Join soft " + CStr(i) + " / " + CStr(NodesNum): Form1.Refresh
+            Form1.Caption = "JoinNodesByID soft " + CStr(i) + " / " + CStr(NodesNum): Form1.Refresh
         End If
 
     Next
@@ -406,7 +477,7 @@ lFound:
         
         If (i And 8191) = 0 Then
             'display progress
-            Form1.Caption = "Join hard " + CStr(i) + " / " + CStr(NodesNum): Form1.Refresh
+            Form1.Caption = "JoinNodesByID hard " + CStr(i) + " / " + CStr(NodesNum): Form1.Refresh
         End If
     Next
 
@@ -434,10 +505,11 @@ Public Sub MergeNodes(node1 As Long, node2 As Long, Optional flag As Long = 0)
             'edge goes from X to node2
             Edges(j).node2 = node1
         End If
-        Nodes(node1).edge(p) = j
-        p = p + 1
+        'Nodes(node1).edge(p) = j
+        Call AddEdgeToNode(node1, j)
+        'p = p + 1
     Next
-    Nodes(node1).Edges = p
+    'Nodes(node1).Edges = p
     Nodes(node2).Edges = 0
     
     'kill all void edges right now
@@ -498,17 +570,19 @@ Public Sub DelNode(node1 As Long)
         Call DelEdge(Nodes(node1).edge(0))
     Wend
     Nodes(node1).Edges = 0
+    Nodes(node1).EdgesAlloc = 0
+    ReDim Nodes(node1).edge(0)
     Nodes(node1).NodeID = MARK_NODEID_DELETED 'mark node as deleted
 End Sub
 
 
 'Save geometry to simple .mp file (without joining of chains)
-Public Sub Save_MP(Filename As String)
+Public Sub Save_MP(filename As String)
     Dim i As Long
     Dim k1 As Long, k2 As Long
     Dim typ As Long
     
-    Open Filename For Output As #2
+    Open filename For Output As #2
     Print #2, "; Generated by mp_extsimp"
     Print #2, ""
     'Print #2, MPheader
@@ -573,7 +647,7 @@ Public Sub Save_MP(Filename As String)
     
         If (i And 8191) = 0 Then
             'display progress
-            Form1.Caption = "Save " + CStr(i) + " / " + CStr(EdgesNum): Form1.Refresh
+            Form1.Caption = "Save_MP " + CStr(i) + " / " + CStr(EdgesNum): Form1.Refresh
         End If
     
 lSkip:
@@ -585,12 +659,12 @@ End Sub
 
 
 'Save geometry to .mp file with joining chains into polylines
-Public Sub Save_MP_2(Filename As String)
+Public Sub Save_MP_2(filename As String)
     Dim i As Long
     Dim k1 As Long, k2 As Long
     Dim typ As Long
     
-    Open Filename For Output As #2
+    Open filename For Output As #2
     
     Print #2, "; Generated by mp_extsimp"
     Print #2, ""
@@ -613,7 +687,7 @@ Public Sub Save_MP_2(Filename As String)
         
         If (i And 8191) = 0 Then
             'display progress
-            Form1.Caption = "Save2 " + CStr(i) + " / " + CStr(EdgesNum): Form1.Refresh
+            Form1.Caption = "Save_MP_2 " + CStr(i) + " / " + CStr(EdgesNum): Form1.Refresh
         End If
     Next
     
@@ -640,7 +714,7 @@ Public Sub DouglasPeucker_total(Epsilon As Double)
 lSkip:
         If (i And 8191) = 0 Then
             'show progress
-            Form1.Caption = "Doug-Pek " + CStr(i) + " / " + CStr(NodesNum): Form1.Refresh
+            Form1.Caption = "DouglasPeucker_total (" + CStr(Epsilon) + ") " + CStr(i) + " / " + CStr(NodesNum): Form1.Refresh
         End If
     Next
 End Sub
@@ -662,7 +736,7 @@ Public Sub DouglasPeucker_total_split(Epsilon As Double, MaxEdge As Double)
 lSkip:
         If (i And 8191) = 0 Then
             'show progress
-            Form1.Caption = "Doug-Pek sp " + CStr(i) + " / " + CStr(NodesNum): Form1.Refresh
+            Form1.Caption = "DouglasPeucker_total_split (" + CStr(Epsilon) + ", " + CStr(MaxEdge) + ") " + CStr(i) + " / " + CStr(NodesNum): Form1.Refresh
         End If
     Next
 End Sub
@@ -677,6 +751,7 @@ Public Sub DouglasPeucker_chain(node1 As Long, Epsilon As Double)
     Dim refedge As edge
     Dim ChainEnd As Long
     Dim NextChainEdge As Long
+    Dim node0 As Long
     
     NextChainEdge = -1
     ChainEnd = 0
@@ -709,6 +784,7 @@ lGoNext:
     '2) go revert - from found end to another one and saving all nodes into Chain() array
     
     ChainNum = 0
+    node0 = k 'start node
     Call AddChain(k)
     Call AddChain(i)
     
@@ -733,8 +809,8 @@ lGoNext2:
     
     Call AddChain(k)
     
-    If k <> Chain(0) And Nodes(k).Edges = 2 Then
-        'still 2 edges - still chain
+    If k <> Chain(0) And k <> node0 And Nodes(k).Edges = 2 Then
+        'still 2 edges - still chain, found first node from chain or node0 - chain loop, exit
         Nodes(k).mark = 1
         j = i
         i = k
@@ -768,7 +844,7 @@ lBreak:
         '   *================*--------------------*-----------*-----*---...
         '                    j                    i
         
-        If Nodes(i).Edges <> 2 Then Exit Sub  'chain from one edge - nothing to optimize by D-P
+        If Nodes(i).Edges <> 2 Or j = node0 Or i = node0 Then Exit Sub 'chain from one edge or loop found - nothing to optimize by D-P
         
         'add both nodes of last edge
         ChainNum = 0
@@ -790,6 +866,7 @@ Public Sub DouglasPeucker_chain_split(node1 As Long, Epsilon As Double, MaxEdge 
     Dim refedge As edge
     Dim ChainEnd As Long
     Dim NextChainEdge As Long
+    Dim node0 As Long
     
     NextChainEdge = -1
     ChainEnd = 0
@@ -816,6 +893,7 @@ lGoNext:
     '2) go revert - from found end to another one and saving all nodes into Chain() array
     
     ChainNum = 0
+    node0 = k 'start node
     Call AddChain(k)
     Call AddChain(i)
     
@@ -840,8 +918,9 @@ lGoNext2:
     
     Call AddChain(k)
     
-    If k <> Chain(0) And Nodes(k).Edges = 2 Then
-        'still 2 edges - still chain
+    'If k <> Chain(0) And Nodes(k).Edges = 2 And Nodes(k).mark = 0 Then
+    If k <> Chain(0) And k <> node0 And Nodes(k).Edges = 2 Then
+        'still 2 edges - still chain, found first node from chain or node0 - chain loop, exit
         Nodes(k).mark = 1
         j = i
         i = k
@@ -875,13 +954,13 @@ lBreak:
         '   *================*--------------------*-----------*-----*---...
         '                    j                    i
         
-        If Nodes(i).Edges <> 2 Then Exit Sub  'chain from one edge - nothing to optimize by D-P
+        If Nodes(i).Edges <> 2 Or j = node0 Or i = node0 Then Exit Sub 'chain from one edge or loop found - nothing to optimize by D-P
         
         'add both nodes of last edge
         ChainNum = 0
         Call AddChain(j)
         Call AddChain(i)
-        
+
         NextChainEdge = -1
         GoTo lGoNext2 'continue with chain
     End If
@@ -926,6 +1005,7 @@ Public Sub SaveChain(edge1 As Long)
         ChainNum = 0
         Call AddChain(i)
         Call AddChain(j)
+        startnode = i 'for detecting loops
         refedge = Edges(edge1)
         
         Edges(edge1).mark = 1 'saved
@@ -1064,6 +1144,9 @@ lBreak:
         
         Edges(NextChainEdge).mark = 1
         
+        If j = startnode Or i = startnode Then Exit Sub 'loop detected - exit
+        'If j = startnode Then Print #2, "; startnode"
+        
         'add both nodes of last edge
         ChainNum = 0
         Call AddChain(j)
@@ -1086,7 +1169,7 @@ End Sub
 'Go by chain from node1 in some direction, but not to Node0
 '(assumed, that node1 have two edges, not 1, not 3 or more, otherwise - UB)
 'Usage: GoByChain(x,x) goes by first edge, z=GoByChain(x,y)->u=GoByChain(z,x)->... allows to travel by chain node by node
-Public Function GoByChain(node1 As Long, Node0 As Long) As Long
+Public Function GoByChain(node1 As Long, node0 As Long) As Long
     Dim i As Long, k As Long
     
     'check first edge
@@ -1094,7 +1177,7 @@ Public Function GoByChain(node1 As Long, Node0 As Long) As Long
     k = Edges(i).node1
     If k = node1 Then k = Edges(i).node2
     GoByChain_lastedge = i
-    If k = Node0 Then
+    If k = node0 Then
         'node0 -> check second edge
         i = Nodes(node1).edge(1)
         k = Edges(i).node1
@@ -1103,7 +1186,6 @@ Public Function GoByChain(node1 As Long, Node0 As Long) As Long
     End If
     GoByChain = k
 End Function
-
 
 'Get edge, conecting node1 and node2, return -1 if no connection
 'TODO(opt): swap node1 and node2 if node2 have smaller edges
@@ -1119,7 +1201,6 @@ Public Function GetEdgeBetween(node1 As Long, node2 As Long) As Long
     Next
     GetEdgeBetween = -1
 End Function
-
 
 'Parse OSM highway class to our own constants
 Public Function GetHighwayType(Text As String) As Long
@@ -1170,11 +1251,11 @@ Public Function GetType_by_Highway(ByVal HighwayType As Long) As Long
         Case HIGHWAY_MOTORWAY_LINK
             GetType_by_Highway = 9
         Case HIGHWAY_TRUNK
-            GetType_by_Highway = 1
+            GetType_by_Highway = Control_TrunkType
         Case HIGHWAY_TRUNK_LINK
-            GetType_by_Highway = 9
+            GetType_by_Highway = Control_TrunkLinkType
         Case HIGHWAY_PRIMARY
-            GetType_by_Highway = 2
+            GetType_by_Highway = Control_PrimaryType
         Case HIGHWAY_PRIMARY_LINK
             GetType_by_Highway = 8
         Case HIGHWAY_SECONDARY
@@ -1574,7 +1655,7 @@ End Sub
 'Load .mp file
 'Remove _link flags from polylines longer than MaxLinkLen
 '(loader is basic and rather stupid, uses relocation on file to read section info without internal buffering)
-Public Sub Load_MP(Filename As String, MaxLinkLen As Double)
+Public Sub Load_MP(filename As String, MaxLinkLen As Double)
     Dim LogOptimization As Long
     Dim sLine As String
     Dim fLat As Double
@@ -1603,7 +1684,7 @@ Public Sub Load_MP(Filename As String, MaxLinkLen As Double)
     
     NodeIDMax = -1 'no nodeid yet
     
-    Open Filename For Input As #1
+    Open filename For Input As #1
     FileLen = LOF(1)
     
     SectionType = 0
@@ -1639,7 +1720,7 @@ lNextLine:
 lStartPoly:
         If (iPrevLine And 1023) = 0 Then
             'display progress
-            Form1.Caption = "Load: " + CStr(iPrevLine) + " / " + CStr(FileLen): Form1.Refresh
+            Form1.Caption = "Load_MP (" + CStr(MaxLinkLen) + ") " + CStr(iPrevLine) + " / " + CStr(FileLen): Form1.Refresh
         End If
         DataLineNum = 0
         If iPhase = 0 Then
@@ -1658,7 +1739,16 @@ lStartPoly:
             MPheader = MPheader + sLine + vbNewLine 'add ending of section into saved header
         End If
         
-        If iPhase = 1 And WaySpeed = -1 Then iPhase = 0 'no routing params found in 1st pass - skip way completely
+        
+        If iPhase = 1 And WaySpeed = -1 Then
+            If Control_LoadNoRoute = 1 Then
+                If WaySpeed = -1 Then WaySpeed = Control_ForceWaySpeed
+                If WayClass = -1 Then WayClass = HIGHWAY_SECONDARY
+            Else
+                iPhase = 0 'no routing params found in 1st pass - skip way completely
+            End If
+        End If
+            
 
         If iPhase > 0 And iPhase < 3 Then
             'not last pass of section -> goto start of it
@@ -1692,12 +1782,15 @@ lStartPoly:
                 If Left(Trim(sLine), 13) = "RouteParamExt" Then GoTo lNoData 'skip ext
                 k2 = InStr(1, sLine, "=") + 1
                 routep = Split(Mid(sLine, k2, Len(sLine) - k2), ",") 'split by "," delimiter
-                WaySpeed = Val(routep(0)) 'direct copy of speed
+                If Control_ForceWaySpeed = -1 Then
+                    WaySpeed = Val(routep(0))  'direct copy of speed
+                Else
+                    WaySpeed = Control_ForceWaySpeed
+                End If
                 WayOneway = Val(routep(2)) 'and oneway
                 If LastCommentHighway = HIGHWAY_UNSPECIFIED Then
                     'WayClass = 3 'default class
-                    WayClass = HIGHWAY_SECONDARY
-                    'TODO: should be detected by Type and WayClass
+                    If Control_LoadMPType = 0 Then WayClass = HIGHWAY_SECONDARY
                 Else
                     'get class from osm2mp comment
                     WayClass = LastCommentHighway
@@ -1715,6 +1808,13 @@ lStartPoly:
                     'ignore others
                     label = ""
                 End If
+                
+            End If
+            If Control_LoadMPType = 1 And Left(Trim(sLine), 5) = "Type=" Then
+                'type
+                k2 = InStr(1, sLine, "=0x")
+                k3 = Val("&h" + Trim(Mid(sLine, k2 + 3, Len(sLine) - k2)))
+                WayClass = GetTypeFromMP(k3)
                 
             End If
         Case 3
@@ -1760,6 +1860,7 @@ lSkipRoadNode:
             ThisLineNodes = 0
             LinkLen = 0
             ChainNum = 0
+            p = NodesNum '1st node of way
             
 lNextPoint:
             'get lat-lon coords from line
@@ -1771,6 +1872,7 @@ lNextPoint:
             If k3 <= 0 Then GoTo lEndData
             fLon = Val(Mid(sLine, k3 + 1, 20))
             
+lAddNode:
             'fill node info
             Nodes(NodesNum).lat = fLat
             Nodes(NodesNum).lon = fLon
@@ -1813,8 +1915,16 @@ lNextPoint:
             GoTo lNextPoint
             
 lEndData:
+        If SectionType = 3 Then
+            'polygone - need to close it
+            If p > -1 Then
+                fLat = Nodes(p).lat
+                fLon = Nodes(p).lon
+                p = -1
+                GoTo lAddNode
+            End If
+        End If
             
-            p = 0
             
 lNoData:
         End If
@@ -1827,6 +1937,7 @@ lNoData:
     'Debug.Print "De-_link-ed: "; NumDelinked 'uncomment to log number of ways
 
 End Sub
+
 
 
 'Check that index is already present in Chain() array
@@ -1963,9 +2074,9 @@ lIteration:
                 If (Edges(i).mark And MARK_DISTCHECK) = 0 Then Call CheckShortLoop2(i, LoopLimit) 'not marked distcheck -> should check it
             End If
         End If
-        If (i And 65535) = 0 Then
+        If (i And 16383) = 0 Then
             'display progress
-            Form1.Caption = "Collapse " + CStr(PassNumber) + ", Shorts " + CStr(i) + " / " + CStr(EdgesNum): Form1.Refresh
+            Form1.Caption = "CollapseJunctions2 (" + CStr(SlideMaxDist) + ", " + CStr(LoopLimit) + ", " + CStr(AngleLimit) + ") #" + CStr(PassNumber) + ", Shorts " + CStr(i) + " / " + CStr(EdgesNum): Form1.Refresh
         End If
     Next
     
@@ -2024,7 +2135,7 @@ lRecheckAgain:
         End If
         If (i And 8191) = 0 Then
             'show progress
-            Form1.Caption = "Collapse " + CStr(PassNumber) + ", Shrink " + CStr(i) + " / " + CStr(NodesNum): Form1.Refresh
+            Form1.Caption = "CollapseJunctions2 (" + CStr(SlideMaxDist) + ", " + CStr(LoopLimit) + ", " + CStr(AngleLimit) + ") #" + CStr(PassNumber) + ", Shrink " + CStr(i) + " / " + CStr(NodesNum): Form1.Refresh
         End If
     Next
     
@@ -2131,7 +2242,7 @@ lSkipEdge:
         If JoiningNodes > 0 Then
             If (JoiningNodes And 127) = 0 Then
                 'display progress
-                Form1.Caption = "Collapse " + CStr(PassNumber) + ", Aim " + CStr(i) + " / " + CStr(JoinGroups): Form1.Refresh
+                Form1.Caption = "CollapseJunctions2 (" + CStr(SlideMaxDist) + ", " + CStr(LoopLimit) + ", " + CStr(AngleLimit) + ") #" + CStr(PassNumber) + ", Aim " + CStr(i) + " / " + CStr(JoinGroups): Form1.Refresh
             End If
             Call FindAiming(Nodes(JoinedNode(i)), AngleLimit) 'find centroid of junction
         End If
@@ -2155,15 +2266,16 @@ lSkipEdge:
                 Else
                     Edges(Nodes(j).edge(m)).node2 = JoinedNode(i)
                 End If
-                k = Nodes(JoinedNode(i)).Edges
-                Nodes(JoinedNode(i)).edge(k) = Nodes(j).edge(m)
-                Nodes(JoinedNode(i)).Edges = k + 1
+                Call AddEdgeToNode(JoinedNode(i), Nodes(j).edge(m))
+                'k = Nodes(JoinedNode(i)).Edges
+                'Nodes(JoinedNode(i)).edge(k) = Nodes(j).edge(m)
+                'Nodes(JoinedNode(i)).Edges = k + 1
             Next
             Nodes(j).Edges = 0 'all edges were reconnected
             Call DelNode(j) 'kill
         End If
         If (j And 8191) = 0 Then
-            Form1.Caption = "Collapse " + CStr(PassNumber) + ", Del " + CStr(j) + " / " + CStr(NodesNum): Form1.Refresh
+            Form1.Caption = "CollapseJunctions2 (" + CStr(SlideMaxDist) + ", " + CStr(LoopLimit) + ", " + CStr(AngleLimit) + ") #" + CStr(PassNumber) + ", Del " + CStr(j) + " / " + CStr(NodesNum): Form1.Refresh
         End If
     Next
     
@@ -2193,7 +2305,7 @@ Public Sub ShrinkBorderNodes(ByVal BorderNum As Long, MaxShift As Double)
     Dim Moving As Long
     Dim Moved As Long
     Dim Dist As Double, dist0 As Double
-    Dim Dist1 As Double
+    Dim dist1 As Double
     Dim dist_min As Double, node_dist_min As Long, edge_dist_min As Long
     ReDim BorderNodes(BorderNum) 'indexes of border-nodes
     ReDim BorderShifts(BorderNum) 'len, passed by border-nodes
@@ -2214,8 +2326,8 @@ lRestartMoving:
         dist0 = 0
         For j = 0 To BorderNum - 1
             If j <> Moving Then
-                Dist1 = Distance(BorderNodes(Moving), BorderNodes(j))
-                dist0 = dist0 + Dist1
+                dist1 = Distance(BorderNodes(Moving), BorderNodes(j))
+                dist0 = dist0 + dist1
             End If
         Next
                 
@@ -2227,16 +2339,16 @@ lRestartMoving:
             If (Edges(e).mark And MARK_JUNCTION) = 0 Then
                 'not junction edge
                 p = Edges(e).node1
-                Dist1 = Distance(p, Edges(e).node2) 'get len of this edge
-                If BorderShifts(Moving) + Dist1 > MaxShift Then GoTo lSkipAsLong 'moving will exceed MaxShift
+                dist1 = Distance(p, Edges(e).node2) 'get len of this edge
+                If BorderShifts(Moving) + dist1 > MaxShift Then GoTo lSkipAsLong 'moving will exceed MaxShift
                 If p = BorderNodes(Moving) Then p = Edges(e).node2 'get other end of edge
                 
                 'calc new sum of distances from this border-node to all others
                 Dist = 0
                 For j = 0 To BorderNum - 1
                     If j <> Moving Then
-                        Dist1 = Distance(p, BorderNodes(j))
-                        Dist = Dist + Dist1
+                        dist1 = Distance(p, BorderNodes(j))
+                        Dist = Dist + dist1
                     End If
                 Next
                 If Dist < dist_min Then dist_min = Dist: node_dist_min = p: edge_dist_min = e 'minimizing found
@@ -2361,7 +2473,7 @@ Public Sub CheckShortLoop2(edge1 As Long, MaxDist As Double)
     Dim e As Long, d As Long, q As Long
     Dim node1 As Long
     Dim node2 As Long
-    Dim dist0 As Double, Dist1 As Double
+    Dim dist0 As Double, dist1 As Double
     
     'wave starts
     node1 = Edges(edge1).node1
@@ -2397,18 +2509,18 @@ Public Sub CheckShortLoop2(edge1 As Long, MaxDist As Double)
             If Nodes(d).mark <> 0 Then
                 If (Nodes(d).mark < 0 And k > 0) Or (Nodes(d).mark > 0 And k < 0) Then
                     'loop found
-                    Dist1 = dist0 + Distance(d, Chain(j)) 'update by len of this edge
-                    Dist1 = Dist1 + Nodes(d).temp_dist 'len of second part of wave
-                    If Dist1 > MaxDist Then GoTo lSkipEdge 'loop is too long
+                    dist1 = dist0 + Distance(d, Chain(j)) 'update by len of this edge
+                    dist1 = dist1 + Nodes(d).temp_dist 'len of second part of wave
+                    If dist1 > MaxDist Then GoTo lSkipEdge 'loop is too long
                     
                     GoTo lShortLoop 'short loop found
                 End If
                 GoTo lSkipEdge
             End If
-            Dist1 = dist0 + Distance(d, Chain(j)) 'update by len of this edge
-            Nodes(d).temp_dist = Dist1 'set passed len
+            dist1 = dist0 + Distance(d, Chain(j)) 'update by len of this edge
+            Nodes(d).temp_dist = dist1 'set passed len
             Nodes(d).mark = k2
-            If Dist1 < MaxDist Then Call AddChain(d) 'add to chain, but only if distance from start is not too long
+            If dist1 < MaxDist Then Call AddChain(d) 'add to chain, but only if distance from start is not too long
 lSkipEdge:
         Next
         j = j + 1
@@ -2917,7 +3029,7 @@ lSkipJ:
         
         If (i And 8191) = 0 Then
             'show progress
-            Form1.Caption = "JA #" + CStr(PassNumber) + " : " + CStr(i) + " / " + CStr(NodesNum): Form1.Refresh
+            Form1.Caption = "JoinAcute (" + CStr(JoinDistance) + ", " + CStr(AcuteKoeff) + ") #" + CStr(PassNumber) + " : " + CStr(i) + " / " + CStr(NodesNum): Form1.Refresh
             DoEvents
         End If
     Next
@@ -2925,7 +3037,7 @@ lSkipJ:
     If Merged > 0 Then
         'at least one change made - relaunch algorithm
         PassNumber = PassNumber + 1
-        Form1.Caption = "JoinAcute " + CStr(PassNumber) + ": " + CStr(Merged) 'show progress
+        Form1.Caption = "JoinAcute (" + CStr(JoinDistance) + ", " + CStr(AcuteKoeff) + ") #" + CStr(PassNumber) + " : merged " + CStr(Merged) 'show progress
         GoTo lIteration
     End If
         
@@ -2952,8 +3064,9 @@ Public Sub ReconnectEdge(edge1 As Long, node1 As Long, node2 As Long)
     
 lFound:
     'add edge1 to node2 edges
-    Nodes(node2).edge(Nodes(node2).Edges) = edge1
-    Nodes(node2).Edges = Nodes(node2).Edges + 1
+    Call AddEdgeToNode(node2, edge1)
+    'Nodes(node2).edge(Nodes(node2).Edges) = edge1
+    'Nodes(node2).Edges = Nodes(node2).Edges + 1
 End Sub
 
 'Get bounding box of edge
@@ -2988,6 +3101,7 @@ Public Function ExpandBbox(ByRef bbox1 As bbox, Dist As Double)
     cos1 = Cos(bbox1.lat_min * DEGTORAD)
     cos2 = Cos(bbox1.lat_max * DEGTORAD)
     If cos2 < cos1 Then cos1 = cos2 'smallest cos() - further from equator
+    If cos1 < 0.01 Then cos1 = 0.01 'beyond 89' lat, ex. Antarctic Territories
     dist_angle = dist_angle / cos1 'distance in degrees of longtitue
     bbox1.lon_min = bbox1.lon_min - dist_angle
     bbox1.lon_max = bbox1.lon_max + dist_angle
@@ -3003,7 +3117,7 @@ End Function
 Public Sub JoinDirections3(JoinDistance As Double, MaxCosine As Double, MaxCosine2 As Double, MinChainLen As Double, CombineDistance As Double)
     Dim i As Long, j As Long, k As Long, mode1 As Long
     Dim e As Long, d As Long, q As Long
-    Dim Dist1 As Double, dist2 As Double
+    Dim dist1 As Double, dist2 As Double
     Dim bbox_edge As bbox
     Dim angl As Double
     Dim min_dist As Double, min_dist_edge As Long
@@ -3053,8 +3167,8 @@ lSkipNode2:
         
         If k = Edges(i).node1 Or k = Edges(i).node2 Or Nodes(k).NodeID = MARK_NODEID_DELETED Or Nodes(k).Edges <> 2 Then GoTo lSkipNode2 'skip nodes of same edge, deleted and complex nodes
         
-        Dist1 = DistanceToSegment(Edges(i).node1, Edges(i).node2, k) 'calc dist from found node to our edge
-        If Dist1 > min_dist Then GoTo lSkipNode2 'too far, skip
+        dist1 = DistanceToSegment(Edges(i).node1, Edges(i).node2, k) 'calc dist from found node to our edge
+        If dist1 > min_dist Then GoTo lSkipNode2 'too far, skip
         
         'node is on join distance, check all (2) edges
         For d = 0 To 1
@@ -3064,8 +3178,8 @@ lSkipNode2:
             If angl < MaxCosine Then
                 'contradirectional edge or close
                 
-                Dist1 = DistanceBetweenSegments(i, q)
-                If Dist1 < min_dist Then min_dist = Dist1: min_dist_edge = q 'found edge close enough
+                dist1 = DistanceBetweenSegments(i, q)
+                If dist1 < min_dist Then min_dist = dist1: min_dist_edge = q 'found edge close enough
             End If
 lSkipEdge2:
         Next
@@ -3106,12 +3220,12 @@ lAllNodes:
             If HalfChain < 10 Then HalfChain = ChainNum + 1 'will "kill" halfchain limit for very short loops
             
             'call metric length of found road
-            Dist1 = 0
+            dist1 = 0
             For j = 1 To ChainNum - 1
-                Dist1 = Dist1 + Distance(Nodes(Chain(j - 1)).mark, Nodes(Chain(j)).mark)
+                dist1 = dist1 + Distance(Nodes(Chain(j - 1)).mark, Nodes(Chain(j)).mark)
             Next
             
-            If Dist1 < MinChainLen Then
+            If dist1 < MinChainLen Then
                 'road is too short -> unmark all edges and not delete anything
                 For j = 0 To ChainNum - 1
                     For k = 0 To Nodes(Chain(j)).Edges - 1
@@ -3294,7 +3408,7 @@ lSkipEdge:
 
         If (i And 8191) = 0 Then
             'show progress
-            Form1.Caption = "JD3: " + CStr(i) + " / " + CStr(EdgesNum): Form1.Refresh
+            Form1.Caption = "JoinDirections3 (" + CStr(JoinDistance) + ", " + CStr(MaxCosine) + ", " + CStr(MaxCosine2) + ", " + CStr(MinChainLen) + ", " + CStr(CombineDistance) + ") : " + CStr(i) + " / " + CStr(EdgesNum): Form1.Refresh
             DoEvents
         End If
     Next
@@ -3669,8 +3783,8 @@ Public Sub BuildNodeClusterIndex(Flags As Long)
     If wholeBbox.lat_max < wholeBbox.lat_min Or wholeBbox.lon_max < wholeBbox.lon_min Then Exit Sub 'no nodes at all or something wrong
     
     'calc number of clusters
-    ClustersLatNum = 1 + (wholeBbox.lat_max - wholeBbox.lat_min) / CLUSTER_SIZE
-    ClustersLonNum = 1 + (wholeBbox.lon_max - wholeBbox.lon_min) / CLUSTER_SIZE
+    ClustersLatNum = 1 + (wholeBbox.lat_max - wholeBbox.lat_min) / Control_ClusterSize
+    ClustersLonNum = 1 + (wholeBbox.lon_max - wholeBbox.lon_min) / Control_ClusterSize
     
     ReDim ClustersFirst(ClustersLatNum * ClustersLonNum) 'starts of chains
     ReDim ClustersLast(ClustersLatNum * ClustersLonNum)  'ends of chains (for updating)
@@ -3690,8 +3804,8 @@ lClustering:
     For i = ClustersIndexedNodes To NodesNum - 1
         If Nodes(i).NodeID <> MARK_NODEID_DELETED Then
             'get cluster from lat/lon
-            x = (Nodes(i).lat - ClustersLat0) / CLUSTER_SIZE
-            y = (Nodes(i).lon - ClustersLon0) / CLUSTER_SIZE
+            x = (Nodes(i).lat - ClustersLat0) / Control_ClusterSize
+            y = (Nodes(i).lon - ClustersLon0) / Control_ClusterSize
             j = x + y * ClustersLatNum
             
             k = ClustersLast(j)
@@ -3723,10 +3837,19 @@ Public Function GetNodeInBboxByCluster(box1 As bbox, Flags As Long) As Long
         'first node needed
         
         'get coordinates of all needed clusters
-        x1 = (box1.lat_min - ClustersLat0) / CLUSTER_SIZE
-        x2 = (box1.lat_max - ClustersLat0) / CLUSTER_SIZE
-        y1 = (box1.lon_min - ClustersLon0) / CLUSTER_SIZE
-        y2 = (box1.lon_max - ClustersLon0) / CLUSTER_SIZE
+        x1 = (box1.lat_min - ClustersLat0) / Control_ClusterSize
+        x2 = (box1.lat_max - ClustersLat0) / Control_ClusterSize
+        y1 = (box1.lon_min - ClustersLon0) / Control_ClusterSize
+        y2 = (box1.lon_max - ClustersLon0) / Control_ClusterSize
+        
+        If x1 < 0 Then x1 = 0
+        If x2 < 0 Then x2 = 0
+        If x1 >= ClustersLatNum Then x1 = ClustersLatNum - 1
+        If x2 >= ClustersLatNum Then x2 = ClustersLatNum - 1
+        If y1 < 0 Then y1 = 0
+        If y2 < 0 Then y2 = 0
+        If y1 >= ClustersLonNum Then y1 = ClustersLonNum - 1
+        If y2 >= ClustersLonNum Then y2 = ClustersLonNum - 1
         
         ClustersFindLastBbox = box1 'store bbox for next searches
         x = x1
@@ -3741,11 +3864,20 @@ Public Function GetNodeInBboxByCluster(box1 As bbox, Flags As Long) As Long
     End If
     
     'get coordinates of all needed clusters
-    x1 = (ClustersFindLastBbox.lat_min - ClustersLat0) / CLUSTER_SIZE
-    x2 = (ClustersFindLastBbox.lat_max - ClustersLat0) / CLUSTER_SIZE
-    y1 = (ClustersFindLastBbox.lon_min - ClustersLon0) / CLUSTER_SIZE
-    y2 = (ClustersFindLastBbox.lon_max - ClustersLon0) / CLUSTER_SIZE
+    x1 = (ClustersFindLastBbox.lat_min - ClustersLat0) / Control_ClusterSize
+    x2 = (ClustersFindLastBbox.lat_max - ClustersLat0) / Control_ClusterSize
+    y1 = (ClustersFindLastBbox.lon_min - ClustersLon0) / Control_ClusterSize
+    y2 = (ClustersFindLastBbox.lon_max - ClustersLon0) / Control_ClusterSize
     
+    If x1 < 0 Then x1 = 0
+    If x2 < 0 Then x2 = 0
+    If x1 >= ClustersLatNum Then x1 = ClustersLatNum - 1
+    If x2 >= ClustersLatNum Then x2 = ClustersLatNum - 1
+    If y1 < 0 Then y1 = 0
+    If y2 < 0 Then y2 = 0
+    If y1 >= ClustersLonNum Then y1 = ClustersLonNum - 1
+    If y2 >= ClustersLonNum Then y2 = ClustersLonNum - 1
+
     'get coordinates of last used cluster
     x = ClustersFindLastCluster Mod ClustersLatNum
     y = (ClustersFindLastCluster - x) \ ClustersLatNum
@@ -3941,21 +4073,29 @@ lIteration:
         End If
         If (i And 8191) = 0 Then
             'show progress
-            Form1.Caption = "CSE " + CStr(i) + " / " + CStr(EdgesNum): Form1.Refresh
+            Form1.Caption = "CollapseShortEdges (" + CStr(CollapseDistance) + ") " + CStr(i) + " / " + CStr(EdgesNum): Form1.Refresh
         End If
     Next
     If somedeleted > 0 Then GoTo lIteration
 End Sub
 
+'Check file len safely
+Public Function FileLen_safe(sFileName As String) As Long
+    On Error Resume Next
+    FileLen_safe = -1
+    FileLen_safe = FileLen(sFileName)
+End Function
 
 
-'Start point
+'Root function of optimization
+'Main generic version for optimizing highways and junctions
 Public Sub OptimizeRouting(InputFile As String)
     Dim OutFile As String
     'Dim OutFile2 As String 'temp file for debug
     Dim time1 As Double
     
-    If InputFile = "" Then Exit Sub 'nothing to do
+    If InputFile = "" Then Exit Sub 'no file - nothing to do
+    If FileLen_safe(InputFile) < 1 Then Exit Sub 'empty or missing file
     
     OutFile = InputFile + "_opt.mp" 'output file
     'OutFile2 = InputFile + "_p.mp"  'output2 - for intermediate results
@@ -4003,6 +4143,9 @@ Public Sub OptimizeRouting(InputFile As String)
     Call FilterVoidEdges
     DoEvents
     
+    Call CombineDuplicateEdgesAll
+    DoEvents
+    
     'Optimize all roads by (Ramer–)Douglas–Peucker algorithm
     Call DouglasPeucker_total(5)
     'Epsilon = 5 metres
@@ -4028,5 +4171,1452 @@ Public Sub OptimizeRouting(InputFile As String)
     Call Save_MP_2(OutFile)
     
     Form1.Caption = "Done " + Format(Timer - time1, "0.00") + " s" 'display timing
+
+End Sub
+
+'##########################################################################################
+'
+'Block of code, used only by additional optimization functions
+'for Planet Overview and so on
+
+'Generalize highways for Planet Overview
+Public Sub OptimizeRouting_hw(InputFile As String) '_hw
+    Dim OutFile As String
+    'Dim OutFile2 As String 'temp file for debug
+    Dim time1 As Double
+    
+    If InputFile = "" Then Exit Sub 'nothing to do
+    
+    OutFile = InputFile + "_opt.mp" 'output file
+    'OutFile2 = InputFile + "_p.mp"  'output2 - for intermediate results
+    
+    time1 = Timer 'start measure time
+    
+    'Init module (all arrays)
+    Call init
+    
+    Control_ClusterSize = 0.05   '0.05 degrees for local maps, 1 for planet-s
+    Control_ForceWaySpeed = 4    'set -1 to not force, 0 or more to forcing this value
+    Control_TrunkType = 2        'set 1 to be have same as motorway = 0x01 Major highway
+    Control_PrimaryType = 3      'set 2 to use 0x02 Principal highway
+    Control_TrunkLinkType = 8    'set 9 to have same as motorway
+    Control_LoadNoRoute = 0      'set 0 to skip no-routing polylines, 1 to load
+    Control_LoadMPType = 0       'set 0 to skip mp Type= field, 1 to parse
+    
+    'Load data from file
+    Call Load_MP(InputFile, 1200)
+    DoEvents
+    
+    'Join nodes by NodeID
+    Call JoinNodesByID
+    DoEvents
+    
+    'Join two way roads into bidirectional ways
+    Call JoinDirections3(70, -0.996, -0.95, 100, 2)
+    '70 metres between directions (Ex: Universitetskii pr, Moscow - 68m)
+    '-0.996 -> (175, 180) degrees for start contradirectional check
+    '-0.95 -> (161.8, 180) degrees for further contradirectional checks
+    '100 metres min two way road
+    '2 metres for joining nodes into one
+    DoEvents
+    
+    Call FilterVoidEdges
+    DoEvents
+    
+    'Call Save_MP(OutFile2)  'temp file for debug
+    'DoEvents
+    
+    'Optimize all roads by (Ramer–)Douglas–Peucker algorithm with limiting edge len
+    Call DouglasPeucker_total_split(5, 100)
+    'Epsilon = 5 metres
+    'Max edge - 100 metres
+    DoEvents
+    
+    Call CollapseJunctions2(3000, 7000, 0.13)
+    'Slide allowed up to 3000 metres
+    'Max junction loop is 6000 metres
+    '0.13 -> ~ 7.46 degress
+    DoEvents
+    
+    Call FilterVoidEdges
+    DoEvents
+    
+    Call RemoveOneWay
+    DoEvents
+    
+    Call CombineDuplicateEdgesAll
+    DoEvents
+    
+    'Optimize all roads by (Ramer–)Douglas–Peucker algorithm
+    Call DouglasPeucker_total(5)
+    'Epsilon = 5 metres
+    DoEvents
+    
+    'Join edges with very acute angle into one
+    Call JoinAcute(100, 3)
+    '100 metres for joining nodes
+    'AcuteKoeff = 3 => 18.4 degrees
+    DoEvents
+    
+    'Optimize all roads by (Ramer–)Douglas–Peucker algorithm
+    Call DouglasPeucker_total(500)
+    'Epsilon = 500 metres
+    DoEvents
+    
+    'Remove very short edges, they are errors, most probably
+    Call CollapseShortEdges(300)
+    'CollapseDistance = 300 metres
+    DoEvents
+    
+    'Combine close nodes and remove duplicate edges
+    Call JoinCloseNodes(200) '200 metres
+    DoEvents
+    Call CombineDuplicateEdgesAll
+    DoEvents
+    
+    'Save result
+    Call Save_MP_2(OutFile)
+    
+    Form1.Caption = "Done " + Format(Timer - time1, "0.00") + " s" 'display timing
+
+End Sub
+
+
+'Generalize highways for Planet Overview with trim by bbox
+'param of launch: filename?a?b?c?d    a - lon min, b - lat min, c - lon max, d - lat max
+Public Sub OptimizeRouting_hwbbox(Cmd As String) '_hwbbox
+    Dim OutFile As String
+    Dim CmdArgs() As String
+    Dim InputFile As String
+    Dim bbox1 As bbox
+    Dim OutFile2 As String 'temp file for debug
+    Dim time1 As Double
+    
+    CmdArgs = Split(Cmd, "?")
+    If UBound(CmdArgs) < 0 Then Exit Sub 'nothing to do
+    
+    InputFile = CmdArgs(0)
+    If InputFile = "" Then Exit Sub 'no file - nothing to do
+    If FileLen_safe(InputFile) < 1 Then Exit Sub 'empty or missing file
+    
+    bbox1.lat_min = -360
+    If UBound(CmdArgs) >= 4 Then
+        bbox1.lon_min = Val(CmdArgs(1))
+        bbox1.lat_min = Val(CmdArgs(2))
+        bbox1.lon_max = Val(CmdArgs(3))
+        bbox1.lat_max = Val(CmdArgs(4))
+    End If
+    
+    OutFile = InputFile + "_opt.mp" 'output file
+    'OutFile2 = InputFile + "_p.mp"  'output2 - for intermediate results
+    
+    time1 = Timer 'start measure time
+    
+    'Init module (all arrays)
+    Call init
+    
+    Control_ClusterSize = 0.05   '0.05 degrees for local maps, 1 for planet-s
+    Control_ForceWaySpeed = 4    'set -1 to not force, 0 or more to forcing this value
+    Control_TrunkType = 2        'set 1 to be have same as motorway = 0x01 Major highway
+    Control_PrimaryType = 3      'set 2 to use 0x02 Principal highway
+    Control_TrunkLinkType = 8    'set 9 to have same as motorway
+    Control_LoadNoRoute = 0      'set 0 to skip no-routing polylines, 1 to load
+    Control_LoadMPType = 0       'set 0 to skip mp Type= field, 1 to parse
+    
+    'Load data from file
+    Call Load_MP(InputFile, 1200)
+    DoEvents
+    
+    'Join nodes by NodeID
+    Call JoinNodesByID
+    DoEvents
+    
+    'Join two way roads into bidirectional ways
+    Call JoinDirections3(70, -0.996, -0.95, 100, 2)
+    '70 metres between directions (Ex: Universitetskii pr, Moscow - 68m)
+    '-0.996 -> (175, 180) degrees for start contradirectional check
+    '-0.95 -> (161.8, 180) degrees for further contradirectional checks
+    '100 metres min two way road
+    '2 metres for joining nodes into one
+    DoEvents
+    
+    Call FilterVoidEdges
+    DoEvents
+    
+    'Call Save_MP(OutFile2)  'temp file for debug
+    'DoEvents
+    
+    'Optimize all roads by (Ramer–)Douglas–Peucker algorithm with limiting edge len
+    Call DouglasPeucker_total_split(5, 100)
+    'Epsilon = 5 metres
+    'Max edge - 100 metres
+    DoEvents
+    
+    Call CollapseJunctions2(3000, 7000, 0.13)
+    'Slide allowed up to 3000 metres
+    'Max junction loop is 7000 metres
+    '0.13 -> ~ 7.46 degress
+    DoEvents
+    
+    Call FilterVoidEdges
+    DoEvents
+    
+    Call RemoveOneWay
+    DoEvents
+    
+    Call CombineDuplicateEdgesAll
+    DoEvents
+    
+    'Optimize all roads by (Ramer–)Douglas–Peucker algorithm
+    Call DouglasPeucker_total(5)
+    'Epsilon = 5 metres
+    DoEvents
+    
+    'Join edges with very acute angle into one
+    Call JoinAcute(100, 3)
+    '100 metres for joining nodes
+    'AcuteKoeff = 3 => 18.4 degrees
+    DoEvents
+    
+    'Optimize all roads by (Ramer–)Douglas–Peucker algorithm
+    Call DouglasPeucker_total(500)
+    'Epsilon = 500 metres
+    DoEvents
+    
+    'Remove very short edges, they are errors, most probably
+    Call CollapseShortEdges(300)
+    'CollapseDistance = 300 metres
+    DoEvents
+    
+    'Combine close nodes and remove duplicate edges
+    Call JoinCloseNodes(200) '200 metres
+    DoEvents
+    Call CombineDuplicateEdgesAll
+    DoEvents
+    
+    'Trim all data by bbox
+    If bbox1.lat_min > -360 Then
+        Call TrimByBbox(bbox1)
+    End If
+    
+    'Save result
+    Call Save_MP_2(OutFile)
+    
+    Form1.Caption = "Done " + Format(Timer - time1, "0.00") + " s" 'display timing
+
+End Sub
+
+
+'Generalize borders (all levels)
+Public Sub OptimizeRouting_borders(InputFile As String) '_borders
+    Dim OutFile As String
+    Dim time1 As Double
+    
+    If InputFile = "" Then Exit Sub 'nothing to do
+    
+    OutFile = InputFile + "_opt.mp" 'output file
+    
+    time1 = Timer 'start measure time
+    
+    'Init module (all arrays)
+    Call init
+    
+    Control_ClusterSize = 0.1
+    Control_ForceWaySpeed = 4
+    Control_TrunkType = 2
+    Control_TrunkLinkType = 8
+    Control_LoadNoRoute = 1
+    Control_LoadMPType = 1
+    
+    'Load data from file
+    Call Load_MP(InputFile, 1200)
+    DoEvents
+    
+    'No data - do nothing
+    If NodesNum < 1 And EdgesNum < 1 Then Exit Sub
+    
+    Call RemoveOneWay
+    DoEvents
+    
+    Call JoinCloseNodes(1) '1 metre
+    DoEvents
+    
+    Call FilterVoidEdges
+    DoEvents
+    
+    Call CombineDuplicateEdgesAll
+    DoEvents
+    
+    Call FilterVoidEdges
+    DoEvents
+    
+    'Optimize all roads by (Ramer–)Douglas–Peucker algorithm
+    Call DouglasPeucker_total(500) 'for zooms 0-2
+    'Call DouglasPeucker_total(5000) 'for zoom 3 e.t.c.
+    DoEvents
+    
+    Call CollapseShortEdges(10)
+    DoEvents
+    
+    Call CombineDuplicateEdgesAll
+    DoEvents
+    
+    'Save result
+    Call Save_MP_2(OutFile)
+    
+    Form1.Caption = "Done " + Format(Timer - time1, "0.00") + " s" 'display timing
+
+End Sub
+
+'Generalize borders for top levels
+Public Sub OptimizeRouting_borders_top(InputFile As String) '_borders_top
+    Dim OutFile As String
+    Dim time1 As Double
+    
+    If InputFile = "" Then Exit Sub 'nothing to do
+    
+    OutFile = InputFile + "_opt.mp" 'output file
+    
+    time1 = Timer 'start measure time
+    
+    'Init module (all arrays)
+    Call init
+    
+    Control_ClusterSize = 0.1
+    Control_ForceWaySpeed = 4
+    Control_TrunkType = 2
+    Control_TrunkLinkType = 8
+    Control_LoadNoRoute = 1
+    Control_LoadMPType = 1
+    
+    'Load data from file
+    Call Load_MP(InputFile, 1200)
+    DoEvents
+    
+    'No data - do nothing
+    If NodesNum < 1 And EdgesNum < 1 Then Exit Sub
+    
+    Call RemoveOneWay
+    DoEvents
+    
+    Call JoinCloseNodes(1) '1 metre
+    DoEvents
+    
+    Call FilterVoidEdges
+    DoEvents
+    
+    Call CombineDuplicateEdgesAll
+    DoEvents
+    
+    Call FilterVoidEdges
+    DoEvents
+    
+    'Optimize all roads by (Ramer–)Douglas–Peucker algorithm
+    Call DouglasPeucker_total(5000) 'for zoom 3 e.t.c.
+    DoEvents
+    
+    Call CollapseShortEdges(10)
+    DoEvents
+    
+    Call CombineDuplicateEdgesAll
+    DoEvents
+    
+    'Save result
+    Call Save_MP_2(OutFile)
+    
+    Form1.Caption = "Done " + Format(Timer - time1, "0.00") + " s" 'display timing
+
+End Sub
+
+
+'Generalize railroads for Planet Overview
+Public Sub OptimizeRouting_rr(InputFile As String) '_rr
+    Dim OutFile As String
+    Dim OutFile2 As String 'temp file for debug
+    Dim time1 As Double
+    
+    If InputFile = "" Then Exit Sub 'nothing to do
+    
+    OutFile = InputFile + "_opt.mp" 'output file
+    OutFile2 = InputFile + "_p.mp"  'output2 - for intermediate results
+    
+    time1 = Timer 'start measure time
+    
+    'Init module (all arrays)
+    Call init
+    
+    Control_ClusterSize = 0.1
+    Control_ForceWaySpeed = 4   'set -1 to not force
+    Control_TrunkType = 2      'set 1 to be have same as motorway
+    Control_TrunkLinkType = 8 'set 9 to have same as motorway
+    Control_LoadNoRoute = 1   'set 0 to skip no-routing polylines
+    Control_LoadMPType = 1        'set 0 to skip mp Type field
+    
+    'Load data from file
+    Call Load_MP(InputFile, 1200)
+    DoEvents
+    
+    'No data - do nothing
+    If NodesNum < 1 And EdgesNum < 1 Then Exit Sub
+    
+    Call RemoveOneWay
+    DoEvents
+    
+    Call JoinCloseNodes(30) '100 m
+    DoEvents
+    
+    Call FilterVoidEdges
+    DoEvents
+    
+    Call CombineDuplicateEdgesAll
+    DoEvents
+    
+    Call CollapseShortEdges(30)
+    DoEvents
+    
+    Call FilterVoidEdges
+    DoEvents
+    
+    'Join edges with very acute angle into one
+    Call JoinAcute(100, 3)
+    '100 metres for joining nodes
+    'AcuteKoeff = 3 => 18.4 degrees
+    DoEvents
+    
+    Call CollapseShortEdges(20)
+    DoEvents
+    
+    Call CollapseJunctions2(3000, 7000, 0.13)
+    'Slide allowed up to 3000 metres
+    'Max junction loop is 7000 metres
+    '0.13 -> ~ 7.46 degress
+    DoEvents
+    
+    'Optimize all roads by (Ramer–)Douglas–Peucker algorithm
+    Call DouglasPeucker_total(100) 'for zooms 0-
+    
+    'Remove very short edges, they are errors, most probably
+    Call CollapseShortEdges(100)
+    DoEvents
+    
+    Call JoinAcute(100, 3)
+    
+    Call CombineDuplicateEdgesAll
+    DoEvents
+    
+lSkip1:
+    
+    'Save result
+    Call Save_MP_2(OutFile)
+    
+    Form1.Caption = "Done " + Format(Timer - time1, "0.00") + " s" 'display timing
+
+End Sub
+
+
+'Generalize railroads for Planet Overview with trim by bbox
+'param of launch: filename?a?b?c?d    a - lon min, b - lat min, c - lon max, d - lat max
+Public Sub OptimizeRouting_rrbbox(Cmd As String) 'rrbbox
+    Dim OutFile As String
+    Dim CmdArgs() As String
+    Dim InputFile As String
+    Dim bbox1 As bbox
+    Dim OutFile2 As String 'temp file for debug
+    Dim time1 As Double
+    
+    CmdArgs = Split(Cmd, "?")
+    If UBound(CmdArgs) < 0 Then Exit Sub 'nothing to do
+    
+    InputFile = CmdArgs(0)
+    If InputFile = "" Then Exit Sub 'no file - nothing to do
+    If FileLen_safe(InputFile) < 1 Then Exit Sub 'empty or missing file
+    
+    bbox1.lat_min = -360
+    If UBound(CmdArgs) >= 4 Then
+        bbox1.lon_min = Val(CmdArgs(1))
+        bbox1.lat_min = Val(CmdArgs(2))
+        bbox1.lon_max = Val(CmdArgs(3))
+        bbox1.lat_max = Val(CmdArgs(4))
+    End If
+    
+    OutFile = InputFile + "_opt.mp" 'output file
+    OutFile2 = InputFile + "_p.mp"  'output2 - for intermediate results
+    
+    time1 = Timer 'start measure time
+    
+    'Init module (all arrays)
+    Call init
+    
+    Control_ClusterSize = 0.1
+    Control_ForceWaySpeed = 4   'set -1 to not force
+    Control_TrunkType = 2      'set 1 to be have same as motorway
+    Control_TrunkLinkType = 8 'set 9 to have same as motorway
+    Control_LoadNoRoute = 1   'set 0 to skip no-routing polylines
+    Control_LoadMPType = 1        'set 0 to skip mp Type field
+    
+    'Load data from file
+    Call Load_MP(InputFile, 1200)
+    DoEvents
+    
+    'No data - do nothing
+    If NodesNum < 1 And EdgesNum < 1 Then Exit Sub
+    
+    Call RemoveOneWay
+    DoEvents
+    
+    Call JoinCloseNodes(30) '30 m
+    DoEvents
+    
+    Call FilterVoidEdges
+    DoEvents
+    
+    Call CombineDuplicateEdgesAll
+    DoEvents
+    
+    '#Call CollapseShortEdges(30)
+    Call CollapseShortEdges(30)
+    DoEvents
+    
+    Call FilterVoidEdges
+    DoEvents
+    
+    'Join edges with very acute angle into one
+    Call JoinAcute(100, 3)
+    '100 metres for joining nodes
+    'AcuteKoeff = 3 => 18.4 degrees
+    DoEvents
+    
+    Call CollapseShortEdges(20)
+    DoEvents
+    
+    Call CollapseJunctions2(3000, 7000, 0.13)
+    'Slide allowed up to 1000 metres
+    'Max junction loop is 1200 metres
+    '0.13 -> ~ 7.46 degress
+    DoEvents
+    
+    'Optimize all roads by (Ramer–)Douglas–Peucker algorithm
+    Call DouglasPeucker_total(100) 'for zooms 0-
+    'Epsilon = 100 m
+    
+    'Remove very short edges, they are errors, most probably
+    Call CollapseShortEdges(100)
+    DoEvents
+    
+    Call JoinAcute(100, 3)
+    
+    Call CombineDuplicateEdgesAll
+    DoEvents
+    
+    'Trim all data by bbox, if specified
+    If bbox1.lat_min > -360 Then
+        Call TrimByBbox(bbox1)
+    End If
+    
+lSkip1:
+    
+    'Save result
+    Call Save_MP_2(OutFile)
+    
+    Form1.Caption = "Done " + Format(Timer - time1, "0.00") + " s" 'display timing
+
+End Sub
+
+
+'For combining railroads or highways for Planet Overview
+'old way, without bbox trim/stitch
+Public Sub OptimizeRouting_comb(InputFile As String) '_comb
+    Dim OutFile As String
+    Dim OutFile2 As String 'temp file for debug
+    Dim time1 As Double
+    
+    If InputFile = "" Then Exit Sub 'nothing to do
+    
+    OutFile = InputFile + "_opt.mp" 'output file
+    OutFile2 = InputFile + "_p.mp"  'output2 - for intermediate results
+    
+    time1 = Timer 'start measure time
+    
+    'Init module (all arrays)
+    Call init
+    Control_ClusterSize = 0.1    '0.05 degrees for local maps, 1 for planet-s
+    Control_ForceWaySpeed = 4    'set -1 to not force, 0 or more to forcing this value
+    Control_TrunkType = 2        'set 1 to be have same as motorway = 0x01 Major highway
+    Control_PrimaryType = 3      'set 2 to use 0x02 Principal highway
+    Control_TrunkLinkType = 8    'set 9 to have same as motorway
+    Control_LoadNoRoute = 1      'set 0 to skip no-routing polylines, 1 to load
+    Control_LoadMPType = 1       'set 0 to skip mp Type= field, 1 to parse
+    
+    'Load data from file
+    Call Load_MP(InputFile, 1200)
+    DoEvents
+    
+    'Call Save_MP(OutFile2)
+    
+    'No data - do nothing
+    If NodesNum < 1 And EdgesNum < 1 Then Exit Sub
+    
+    Call RemoveOneWay
+    DoEvents
+    
+    Call JoinCloseNodes(100) '100 metres
+    DoEvents
+    
+    Call FilterVoidEdges
+    DoEvents
+    
+    Call CombineDuplicateEdgesAll
+    DoEvents
+    
+    Call CollapseShortEdges(30)
+    DoEvents
+    
+    Call FilterVoidEdges
+    DoEvents
+    
+    'Join edges with very acute angle into one
+    Call JoinAcute(100, 3)
+    '100 metres for joining nodes
+    'AcuteKoeff = 3 => 18.4 degrees
+    DoEvents
+    
+    Call CollapseShortEdges(20)
+    DoEvents
+    
+    'Optimize all roads by (Ramer–)Douglas–Peucker algorithm
+    Call DouglasPeucker_total(100) 'for zooms 0+
+    
+    'Remove very short edges, they are errors, most probably
+    Call CollapseShortEdges(100)
+    DoEvents
+    
+    Call CombineDuplicateEdgesAll
+    DoEvents
+    
+lSkip1:
+    
+    'Save result
+    'Call Save_MP(OutFile2)
+    Call Save_MP_2(OutFile)
+    
+    Form1.Caption = "Done " + Format(Timer - time1, "0.00") + " s" 'display timing
+
+End Sub
+
+
+'For combining highways or railways for Planet Overview with stitching on 5x5 and 1x1 borders
+Public Sub OptimizeRouting_stitch(InputFile As String) '_stitch
+    Dim OutFile As String
+    'Dim OutFile2 As String 'temp file for debug
+    Dim time1 As Double
+    Dim bbox1 As bbox
+    Dim i As Long, j As Long
+    
+    If InputFile = "" Then Exit Sub 'nothing to do
+    
+    OutFile = InputFile + "_opt.mp" 'output file
+    'OutFile2 = InputFile + "_p.mp"  'output2 - for intermediate results
+    
+    time1 = Timer 'start measure time
+    
+    'Init module (all arrays)
+    Call init
+    
+    Control_ClusterSize = 0.1    '0.05 degrees for local maps, 1 for planet-s
+    Control_ForceWaySpeed = 4    'set -1 to not force, 0 or more to forcing this value
+    Control_TrunkType = 2        'set 1 to be have same as motorway = 0x01 Major highway
+    Control_PrimaryType = 3      'set 2 to use 0x02 Principal highway
+    Control_TrunkLinkType = 8    'set 9 to have same as motorway
+    Control_LoadNoRoute = 0      'set 0 to skip no-routing polylines, 1 to load
+    Control_LoadMPType = 1       'set 0 to skip mp Type= field, 1 to parse
+    
+    'Load data from file
+    Call Load_MP(InputFile, 1200)
+    DoEvents
+    
+    'No data - do nothing
+    If NodesNum < 1 And EdgesNum < 1 Then Exit Sub
+    
+    Call JoinCloseNodes(1) 'join close nodes, not by ID as file expected to be concat of different files with id collisions
+    DoEvents
+    
+    'index nodes
+    Call BuildNodeClusterIndex(0)
+    
+    '1. Stitch all world-wide lines
+    For i = -175 To 175 Step 5
+        bbox1.lat_min = -90
+        bbox1.lat_max = 90
+        bbox1.lon_min = i
+        bbox1.lon_max = i
+        'beware, double type have finite precision
+        'recommended to setup integer coordinates
+        'or having N/2^m part (.5, .25, .375, .5625 and so on)
+        'or range, ex. min=29.39999,max=29.40001
+        
+        Call StitchNodes(bbox1, 1000) '1000m
+        DoEvents
+    Next
+    
+    For i = -85 To 85 Step 5
+        bbox1.lat_min = i
+        bbox1.lat_max = i
+        bbox1.lon_min = -180
+        bbox1.lon_max = 180
+        
+        Call StitchNodes(bbox1, 1000) '1000m
+        DoEvents
+    Next
+    
+    '2. Stitch all small lines
+    
+    'example for highways
+    Call Stitch1x1from5x5(40, -75, 1000)
+    Call Stitch1x1from5x5(35, 135, 1000)
+    Call Stitch1x1from5x5(50, -5, 1000)
+    Call Stitch1x1from5x5(50, 5, 1000)
+    Call Stitch1x1from5x5(45, 0, 1000)
+    Call Stitch1x1from5x5(45, 5, 1000)
+    Call Stitch1x1from5x5(45, 10, 1000)
+
+    'example for railways
+'    For j = 45 To 50 Step 5
+'    For i = -5 To 10 Step 5
+'    Call Stitch1x1from5x5(CDbl(j), CDbl(i), 1000)
+'    Next
+'    Next
+
+    'Join close nodes afterward, just in case
+    Call JoinCloseNodes(1)
+    DoEvents
+    
+    'Save result
+    Call Save_MP_2(OutFile)
+    
+    Form1.Caption = "Done " + Format(Timer - time1, "0.00") + " s" 'display timing
+
+End Sub
+
+
+'For sorting peaks and volcanos to zoom levels
+'Load and save osm file(s), not mp
+Public Sub OptimizeRouting_ele(InputFile As String) '_ele
+    Dim OutFile As String
+    'Dim OutFile2 As String 'temp file for debug
+    Dim time1 As Double
+    
+    If InputFile = "" Then Exit Sub 'nothing to do
+    
+    OutFile = InputFile + "_lev" 'output file
+    'OutFile2 = InputFile + "_p.mp"  'output2 - for intermediate results
+    
+    time1 = Timer 'start measure time
+    
+    'Init module (all arrays)
+    Call init
+    
+    Control_ClusterSize = 0.5
+    'other control_ are irrelevant
+    
+    'Fake world bbox - by two nodes
+    Nodes(NodesNum).lat = -90
+    Nodes(NodesNum).lon = -180
+    AddNode
+    Nodes(NodesNum).lat = 90
+    Nodes(NodesNum).lon = 180
+    AddNode
+    Call BuildNodeClusterIndex(0)
+    
+    Nodes(0).NodeID = MARK_NODEID_DELETED 'mark two fake nodes as deleted
+    Nodes(1).NodeID = MARK_NODEID_DELETED
+    
+    'Load data from file
+    Call Load_OSM_lined(InputFile)
+    DoEvents
+    
+    'Sort nodes
+    Call SortNodesByEle
+    DoEvents
+    
+    'Save to 4 out files
+    Call Save_OSM_lined(OutFile)
+    
+    Form1.Caption = "Done " + Format(Timer - time1, "0.00") + " s" 'display timing
+
+End Sub
+
+'For optimizing bathymetry from NaturalEarth
+Public Sub OptimizeRouting_bathy(InputFile As String) '_bathy
+    Dim OutFile As String
+    Dim OutFile2 As String 'temp file for debug
+    Dim time1 As Double
+    
+    If InputFile = "" Then Exit Sub 'nothing to do
+    
+    OutFile = InputFile + "_opt.mp" 'output file
+    OutFile2 = InputFile + "_p.mp"  'output2 - for intermediate results
+    
+    time1 = Timer 'start measure time
+    
+    'Init module (all arrays)
+    Call init
+    
+    Control_ClusterSize = 0.5
+    Control_ForceWaySpeed = 4
+    Control_TrunkType = 2
+    Control_TrunkLinkType = 8
+    Control_LoadNoRoute = 1
+    Control_LoadMPType = 1
+    
+    'Load data from file
+    Call Load_MP(InputFile, 1200)
+    DoEvents
+    
+    'Call Save_MP(OutFile2)
+    
+    'No data - do nothing
+    If NodesNum < 1 And EdgesNum < 1 Then Exit Sub
+    
+    Call RemoveOneWay
+    DoEvents
+    
+    'Call JoinCloseNodes(15) '15 m - for ne_10m_bathymetry_K_200.mp
+    Call JoinCloseNodes(1) '1 m - for all other
+    DoEvents
+    
+    Call FilterVoidEdges
+    DoEvents
+    
+    Call CombineDuplicateEdgesAll
+    DoEvents
+    
+    Call CollapseShortEdges(500)
+    'DoEvents
+    
+    Call CombineDuplicateEdgesAll
+    DoEvents
+    
+    Call FilterVoidEdges
+    DoEvents
+    
+    'Optimize all roads by (Ramer–)Douglas–Peucker algorithm
+    Call DouglasPeucker_total(5000) 'for zooms 0-
+    
+    
+    'Remove very short edges, they are errors, most probably
+    Call CollapseShortEdges(1000)
+    DoEvents
+    
+    Call CombineDuplicateEdgesAll
+    DoEvents
+    
+lSkip1:
+    
+    'Save result
+    Call Save_MP_2(OutFile)
+    
+    Form1.Caption = "Done " + Format(Timer - time1, "0.00") + " s" 'display timing
+
+End Sub
+
+
+'Remove flag oneway from all edges
+Public Sub RemoveOneWay()
+    Dim i As Long
+    For i = 0 To EdgesNum - 1
+        Edges(i).oneway = 0
+        If (i And 32767) = 0 Then
+            'show progress
+            Form1.Caption = "RemoveOneWay " + CStr(i) + " / " + CStr(EdgesNum): Form1.Refresh
+        End If
+    Next
+End Sub
+
+
+'Combinde pair of edges, which connects same nodes (including specified one)
+Public Sub CombineDuplicateEdges(ByVal node1 As Long)
+    Dim i As Long, j As Long, e1 As Long, e2 As Long
+    Dim node2 As Long
+    
+    i = 0
+    
+    While i < Nodes(node1).Edges - 1
+        e1 = Nodes(node1).edge(i)
+        node2 = Edges(e1).node2
+        If node2 = node1 Then node2 = Edges(e1).node1
+        
+        j = i + 1
+        While j < Nodes(node1).Edges
+            e2 = Nodes(node1).edge(j)
+            If Edges(e2).node1 = node2 Or Edges(e2).node2 = node2 Then
+                'other end nodes are the same - combine
+                Call CombineEdges(e1, e2, node1)
+            End If
+            j = j + 1
+        Wend
+        i = i + 1
+    Wend
+    
+End Sub
+
+
+'Combinde pair of edges, which connects same nodes
+Public Sub CombineDuplicateEdgesAll()
+    Dim i As Long
+    For i = 0 To NodesNum - 1
+        If Nodes(i).NodeID <> MARK_NODEID_DELETED Then
+            Call CombineDuplicateEdges(i) 'check edges of each node
+        End If
+        If (i And 8191) = 0 Then
+            'show progress
+            Form1.Caption = "CombineDuplicateEdgesAll " + CStr(i) + " / " + CStr(NodesNum): Form1.Refresh
+        End If
+    Next
+End Sub
+
+
+'Join nodes close to each other
+'DistLimit - max distance for joining
+Public Sub JoinCloseNodes(ByVal DistLimit As Double)
+    Dim i As Long, j As Long
+    Dim mode1 As Long
+    Dim bbox1 As bbox
+    Dim DistLimitSq As Double
+    
+    'build index for finding close nodes
+    DistLimitSq = DistLimit * DistLimit
+    Call BuildNodeClusterIndex(0)
+    
+    For i = 0 To NodesNum - 1
+        If Nodes(i).NodeID <> MARK_NODEID_DELETED Then
+            
+            'Create bbox for area around node
+            mode1 = 0
+            bbox1.lat_max = Nodes(i).lat
+            bbox1.lat_min = Nodes(i).lat
+            bbox1.lon_max = Nodes(i).lon
+            bbox1.lon_min = Nodes(i).lon
+            Call ExpandBbox(bbox1, DistLimit)
+            
+lNextNode:
+            j = GetNodeInBboxByCluster(bbox1, mode1)
+            mode1 = 1 '"next" next time
+            If j = -1 Then GoTo lAllNodes 'no more nodes
+            
+            If i <> j And Nodes(j).NodeID <> MARK_NODEID_DELETED And DistanceSquare(i, j) < DistLimitSq Then
+                'skip same node, deleted nodes and too far
+                
+                Call MergeNodes(i, j, 1) 'merge
+                Call CombineDuplicateEdges(i) 'removed duplicate edges
+            End If
+            GoTo lNextNode
+lAllNodes:
+    
+        If (i And 8191) = 0 Then
+            'show progress
+            Form1.Caption = "JoinCloseNodes (" + CStr(DistLimit) + ") " + CStr(i) + " / " + CStr(NodesNum): Form1.Refresh
+        End If
+            
+        End If
+    Next
+
+
+End Sub
+
+
+'Sort nodes to zoom levels by location and elevation
+'Assumes:
+'1) that nodes already sorted be elevation - first nodes must have max elevation
+'2) value of parsed tag "ele" must be in .temp_dist field
+'3) ClusterIndex is initialized, but no filled with (live) nodes
+'Function sets .mark field to 1, 2 and 3 to indicate zoom
+'To zoom 3 - all nodes are not close than 150km
+'To zoom 2 - all nodes are not close than 40km
+'To zoom 1 - all nodes are not close than 10km
+'Rest nodes remain on zoom 0
+'Nodes with unclear ele and <1000 - always on zoom 0
+Public Sub SortNodesByEle()
+    Dim i As Long
+    Dim j As Long
+    Dim k As Long
+    Dim DistLimit As Double
+    Dim DistLimitSq As Double
+    Dim bbox1 As bbox
+    Dim mode1 As Long
+    Dim MinEle As Double
+    
+    MinEle = 1000 'below - to zoom 0
+    
+    ReDim Preserve ClustersChain(NodesNum) 'allocate for whole chain
+    
+    For k = 3 To 1 Step -1
+        Select Case k
+            Case 1 'zooms 2.1-8km
+                DistLimit = 10000 '10km
+            Case 2 'zooms 8.1-30km
+                DistLimit = 40000 '40km
+            Case 3 'zooms 31-120 km
+                DistLimit = 150000 '150km
+            End Select
+            DistLimitSq = DistLimit * DistLimit
+        
+        For i = 0 To NodesNum - 1
+            If Nodes(i).mark > 0 Then GoTo lSkipNode 'already higher level
+            If Nodes(i).temp_dist < MinEle Then GoTo lSkipNode 'too small
+            If Nodes(i).NodeID = MARK_NODEID_DELETED Then GoTo lSkipNode 'deleted
+            
+            'Create bbox around node
+            mode1 = 0
+            bbox1.lat_max = Nodes(i).lat
+            bbox1.lat_min = Nodes(i).lat
+            bbox1.lon_max = Nodes(i).lon
+            bbox1.lon_min = Nodes(i).lon
+            Call ExpandBbox(bbox1, DistLimit)
+            
+            'Search to indexed nodes around this one
+lNextGet:
+            j = GetNodeInBboxByCluster(bbox1, mode1)
+            mode1 = 1
+            If j = -1 Then GoTo lNotFound
+            
+            If DistanceSquare(i, j) < DistLimitSq Then GoTo lSkipNode
+            GoTo lNextGet
+lNotFound:
+            'no indexed nodes found - add this one to index
+            Nodes(i).mark = k 'store found zoom level
+            Call AddNodeToClusterIndex(i)
+lSkipNode:
+        
+            If (i And 8191) = 0 Then
+                'show progress
+                Form1.Caption = "SortNodesByEle level " + CStr(k) + ", " + CStr(i) + " / " + CStr(NodesNum): Form1.Refresh
+            End If
+        
+        Next
+    Next
+
+End Sub
+
+
+'Loosely load nodes from osm file
+'Expect for osm file to have all node info in one line
+'Does not parse XML, only found all need info
+'field .label in Edge used to store lines of OSM XML for further resave
+Public Sub Load_OSM_lined(filename As String)
+    Dim i As Long, j As Long, k As Long
+    Dim FileLen As Long
+    Dim sLine As String
+    Dim fLat As Double
+    Dim fLon As Double
+    Dim ele_str As String
+    Dim ele As Double
+    Dim NodeID As String
+    
+    NodeIDMax = -1 'no nodeid yet
+    
+    Open filename For Input As #1
+    FileLen = LOF(1)
+    
+lNextLine:
+    Line Input #1, sLine
+    
+    'check POI type
+    i = InStr(1, sLine, "<tag k=""natural"" v=""peak""/>")
+    j = InStr(1, sLine, "<tag k=""natural"" v=""volcano""/>")
+    If i < 1 And j < 1 Then GoTo lSkipNode
+    
+    'check presence of node id
+    i = InStr(1, sLine, "<node id=""")
+    If i < 1 Then GoTo lSkipNode 'no id
+    j = InStr(i + 10, sLine, """")
+    If j < 1 Then GoTo lSkipNode 'no ending "
+    
+    NodeID = Mid(sLine, i + 10, j - i - 10)
+    
+    'parse lat
+    i = InStr(1, sLine, " lat=""")
+    If i < 1 Then GoTo lSkipNode 'no lat - skip line
+    
+    fLat = Val(Mid(sLine, i + 6, 20))
+    
+    'parse lon
+    i = InStr(1, sLine, " lon=""")
+    If i < 1 Then GoTo lSkipNode
+    
+    fLon = Val(Mid(sLine, i + 6, 20))
+    
+    'parse ele
+    i = InStr(1, sLine, " k=""ele""")
+    If i < 1 Then GoTo lSkipNode 'no ele
+    
+    j = InStr(i + 12, sLine, """")
+    If j < 1 Then GoTo lSkipNode 'no ending "
+    ele_str = Mid(sLine, i + 12, j - i - 12)
+    ele = Val(ele_str)
+    If InStr(1, ele_str, "f") > 0 Then
+        'f - feet, elevation in feets will be treated as 0
+        ele = 0
+    End If
+    
+    'save node info
+    j = NodesNum
+    Nodes(NodesNum).lat = fLat
+    Nodes(NodesNum).lon = fLon
+    Nodes(NodesNum).Edges = 0
+    Nodes(NodesNum).NodeID = -1
+    Nodes(NodesNum).temp_dist = ele
+    Nodes(NodesNum).mark = 0
+    Call AddNode
+    
+    'save edge info - label = line of OSM
+    k = EdgesNum
+    Edges(EdgesNum).node1 = j
+    Edges(EdgesNum).node2 = j
+    'Edges(EdgesNum).label = NodeID
+    Edges(EdgesNum).label = sLine
+    Call AddEdge
+    
+    Call AddEdgeToNode(j, k)
+    
+    
+    If (NodesNum And 1023) = 0 Then
+        'display progress
+        Form1.Caption = "Load_OSM_lined: " + CStr(Seek(1)) + " / " + CStr(FileLen): Form1.Refresh
+    End If
+    
+
+lSkipNode:
+    If Not EOF(1) Then GoTo lNextLine
+    
+    Close #1
+
+End Sub
+
+
+'Save OSM files from similar loaded earlier (see Load_OSMlined)
+'Saved 4 files - each for 4 zooms from 0 to 3
+Public Sub Save_OSM_lined(filename As String)
+    Dim i As Long, j As Long
+    Dim k1 As Long, k2 As Long
+    Dim typ As Long
+    
+    For k1 = 0 To 3
+        Open filename + CStr(k1) + ".osm" For Output As #2
+        'OSM header
+        Print #2, "<?xml version='1.0' encoding='UTF-8'?>"
+        Print #2, "<osm version='0.6' generator='mp_extsimp1'>"
+        
+        'save lines from nodes of specific zoom
+        For i = 0 To NodesNum - 1
+            If Nodes(i).NodeID = MARK_NODEID_DELETED Then GoTo lSkipNode
+            If Nodes(i).mark <> k1 Then GoTo lSkipNode
+            j = Nodes(i).edge(0)
+            Print #2, Edges(j).label
+            
+            If (i And 8191) = 0 Then
+                'display progress
+                Form1.Caption = "Save_OSM_lined " + CStr(i) + " / " + CStr(NodesNum): Form1.Refresh
+            End If
+            
+lSkipNode:
+        Next
+        Print #2, "</osm>" 'ending marker
+        Close #2
+        
+    Next
+End Sub
+
+
+'Parse mp Type to our own constants
+Public Function GetTypeFromMP(MPType As Long) As Long
+    Select Case MPType
+    Case &H1 'Major highway
+        GetTypeFromMP = HIGHWAY_MOTORWAY
+    Case &H2 'Principal highway
+        GetTypeFromMP = HIGHWAY_TRUNK
+    Case &H3 'Other highway road
+        GetTypeFromMP = HIGHWAY_PRIMARY
+        
+    'block for simplification of borders
+    Case &H1E 'Country border
+        GetTypeFromMP = HIGHWAY_PRIMARY
+    Case &H1C 'State/region border
+        GetTypeFromMP = HIGHWAY_SECONDARY
+    Case Else
+        GetTypeFromMP = HIGHWAY_SECONDARY
+    End Select
+End Function
+
+
+'Add 1 node to ClusterIndex array (array must be prepared)
+'Warning: should not be called before BuildNodeClusterIndex(1)
+Public Sub AddNodeToClusterIndex(node1 As Long)
+    Dim i As Long, j As Long, k As Long
+    Dim x As Long
+    Dim y As Long
+    
+    i = node1
+    If Nodes(i).NodeID <> MARK_NODEID_DELETED Then
+        'get cluster from lat/lon
+        x = (Nodes(i).lat - ClustersLat0) / Control_ClusterSize
+        y = (Nodes(i).lon - ClustersLon0) / Control_ClusterSize
+        j = x + y * ClustersLatNum
+        
+        k = ClustersLast(j)
+        If k = -1 Then
+            'first index in chain of this cluster
+            ClustersFirst(j) = i
+        Else
+            'continuing chain
+            ClustersChain(k) = i
+        End If
+        ClustersChain(i) = -1 'this is last node in chain
+        ClustersLast(j) = i
+    End If
+    ClustersIndexedNodes = 0 ' fake value, as node1 may not be last in indexed
+
+End Sub
+
+
+'Trim map by specified bbox
+'All edges crossing bbox will be cut by inserting new node and reconnecting edge from outside node to new one
+'All nodes outside bbox will be deleted
+'Should correctly handle edges on corner and bbox-wide edges
+Public Sub TrimByBbox(bbox1 As bbox)
+    Dim i As Long, j As Long, k As Long
+    Dim p1 As Long
+    Dim p2 As Long
+    Dim px As Long
+    
+    'Trim all edges crossing bbox
+    For i = 0 To EdgesNum - 1
+    If Edges(i).node1 = -1 Then GoTo lSkip1
+        
+lCheckAgain:
+        p1 = Edges(i).node1
+        p2 = Edges(i).node2
+        
+        If Nodes(p1).lat < bbox1.lat_min And Nodes(p2).lat > bbox1.lat_min Then
+            'trim edge by lat_min
+            px = p1 'node1 will be deleted
+            GoTo lTrim1
+        End If
+        If Nodes(p2).lat < bbox1.lat_min And Nodes(p1).lat > bbox1.lat_min Then
+            'trim edge by lat_min
+            px = p2 'node2 will be deleted
+lTrim1:
+            j = NodesNum
+            Nodes(j).lat = bbox1.lat_min 'new node coordinates
+            Nodes(j).lon = Nodes(p1).lon + (Nodes(p2).lon - Nodes(p1).lon) * (bbox1.lat_min - Nodes(p1).lat) / (Nodes(p2).lat - Nodes(p1).lat)
+            Call AddNode
+            Call ReconnectEdge(i, px, j)
+            GoTo lCheckAgain  'check edge again as it may cross other sides of bbox as well
+        End If
+
+        If Nodes(p1).lat < bbox1.lat_max And Nodes(p2).lat > bbox1.lat_max Then
+            'trim edge by lat_max
+            px = p2 'node2 will be deleted
+            GoTo lTrim2
+        End If
+        If Nodes(p2).lat < bbox1.lat_max And Nodes(p1).lat > bbox1.lat_max Then
+            'trim edge by lat_min
+            px = p1 'node1 will be deleted
+lTrim2:
+            j = NodesNum
+            Nodes(j).lat = bbox1.lat_max
+            Nodes(j).lon = Nodes(p1).lon + (Nodes(p2).lon - Nodes(p1).lon) * (bbox1.lat_max - Nodes(p1).lat) / (Nodes(p2).lat - Nodes(p1).lat)
+            Call AddNode
+            Call ReconnectEdge(i, px, j)
+            GoTo lCheckAgain
+        End If
+
+        If Nodes(p1).lon < bbox1.lon_min And Nodes(p2).lon > bbox1.lon_min Then
+            'trim edge by lon_min
+            px = p1 'node1 will be deleted
+            GoTo lTrim3
+        End If
+        If Nodes(p2).lon < bbox1.lon_min And Nodes(p1).lon > bbox1.lon_min Then
+            'trim edge by lon_min
+            px = p2 'node2 will be deleted
+lTrim3:
+            j = NodesNum
+            Nodes(j).lat = Nodes(p1).lat + (Nodes(p2).lat - Nodes(p1).lat) * (bbox1.lon_min - Nodes(p1).lon) / (Nodes(p2).lon - Nodes(p1).lon)
+            Nodes(j).lon = bbox1.lon_min
+            Call AddNode
+            Call ReconnectEdge(i, px, j)
+            GoTo lCheckAgain
+        End If
+
+        If Nodes(p1).lon < bbox1.lon_max And Nodes(p2).lon > bbox1.lon_max Then
+            'trim edge by lon_max
+            px = p2 'node2 will be deleted
+            GoTo lTrim4
+        End If
+        If Nodes(p2).lon < bbox1.lon_max And Nodes(p1).lon > bbox1.lon_max Then
+            'trim edge by lon_max
+            px = p1 'node1 will be deleted
+lTrim4:
+            j = NodesNum
+            Nodes(j).lat = Nodes(p1).lat + (Nodes(p2).lat - Nodes(p1).lat) * (bbox1.lon_max - Nodes(p1).lon) / (Nodes(p2).lon - Nodes(p1).lon)
+            Nodes(j).lon = bbox1.lon_max
+            Call AddNode
+            Call ReconnectEdge(i, px, j)
+            GoTo lCheckAgain
+        End If
+
+lSkip1:
+        If (i And 8191) = 0 Then
+            'show progress
+            Form1.Caption = "TrimByBbox, trim " + CStr(i) + " / " + CStr(EdgesNum): Form1.Refresh
+        End If
+    Next
+    
+    'Now no single edge cross bbox
+    
+    'Delete all nodes outside bbox with remaining edges
+    For i = 0 To NodesNum - 1
+        If Nodes(i).NodeID = MARK_NODEID_DELETED Then GoTo lSkip2
+    
+        If Nodes(i).lat < bbox1.lat_min Or _
+            Nodes(i).lat > bbox1.lat_max Or _
+            Nodes(i).lon < bbox1.lon_min Or _
+            Nodes(i).lon > bbox1.lon_max Then
+            Call DelNode(i)
+        End If
+
+lSkip2:
+        If (i And 8191) = 0 Then
+            'show progress
+            Form1.Caption = "TrimByBbox, del " + CStr(i) + " / " + CStr(EdgesNum): Form1.Refresh
+        End If
+
+    Next
+End Sub
+
+
+'Function to stitch roads, trimmed by two near bbox
+'bbox1 - bbox of/around border
+'MaxDist - max distance between nodes to stitch
+'Assumed, that clusterindex were built before the call
+Public Sub StitchNodes(bbox1 As bbox, MaxDist As Double)
+    Dim i As Long, k As Long
+    Dim j As Long, k2 As Long
+    Dim p As Long
+    Dim mode1 As Long
+    Dim bbox2 As bbox
+    Dim d As Double
+    Dim edge1 As Long, edge2 As Long
+    Dim MaxDistSQ As Double
+    Dim edge_cos As Double
+    Dim bbox_type As Long '0 - same lat, 1 - same lon
+    Dim MinDist As Double, nodeMinDist As Long
+    
+    MaxDistSQ = MaxDist * MaxDist
+    
+    'check bbox type
+    If (bbox1.lat_max - bbox1.lat_min) < (bbox1.lon_max - bbox1.lon_min) Then
+        '  same lat: ---
+        bbox_type = 0
+    Else
+        '  same lon: |
+        bbox_type = 1
+    End If
+
+    'show progress
+    Form1.Caption = "StitchNodes (" + CStr(bbox1.lat_min) + "," + CStr(bbox1.lon_min) + ";" + CStr(MaxDist) + ")": Form1.Refresh
+    
+    'index all nodes on border to Chain
+    ChainNum = 0
+    
+    mode1 = 0
+lNextNode:
+    j = GetNodeInBboxByCluster(bbox1, mode1)
+    mode1 = 1 '"next" next time
+    If j > -1 Then
+    
+        If Nodes(j).Edges <> 1 Then GoTo lNextNode 'skip not ends
+        Call AddChain(j)
+        Nodes(j).mark = 0 'edge to the botton (south) or left (west)
+        
+        k = Nodes(j).edge(0)
+        i = Edges(k).node1
+        If i = j Then i = Edges(k).node2
+        If bbox_type = 0 Then
+            If Nodes(i).lat > bbox1.lat_max Then Nodes(j).mark = 1 ' edge to the top (north)
+        Else
+            If Nodes(i).lon > bbox1.lon_max Then Nodes(j).mark = 1 ' edge to the right (east)
+        End If
+        
+        GoTo lNextNode
+    End If
+    
+    
+    'check all indexed node, searching best for joining
+    
+    For i = 0 To ChainNum - 1
+        k = Chain(i)
+        If Nodes(k).NodeID = MARK_NODEID_DELETED Or Nodes(k).Edges <> 1 Then GoTo lSkip1 'skip already stitched
+        
+        nodeMinDist = -1
+        MinDist = MaxDistSQ
+        
+        For j = i + 1 To ChainNum - 1
+            k2 = Chain(j)
+            If Nodes(k2).mark = Nodes(k).mark Then GoTo lSkip2 'edges at the same side of stitch line
+            If Nodes(k2).NodeID = MARK_NODEID_DELETED Then GoTo lSkip2 'skip already stitched
+            If Nodes(k2).Edges <> 1 Then GoTo lSkip2 'skip already stitched
+            d = DistanceSquare(k, k2)
+            If d > MaxDistSQ Then GoTo lSkip2 'node too far
+            
+            edge1 = Nodes(k).edge(0)
+            edge2 = Nodes(k2).edge(0)
+            If Edges(edge1).roadtype <> Edges(edge2).roadtype Then GoTo lSkip2 'do not stitch different road classes
+            'speed class is ignored for now
+            
+            edge_cos = CosAngleBetweenEdges(edge1, edge2) 'calc cosine between edges
+            
+            d = d * (1 - Abs(edge_cos)) 'weight sq-distance and angle
+            'the lesser distance or angle between edges - the better
+            
+            'find best matched node for selected one (k)
+            If d < MinDist Then MinDist = d: nodeMinDist = k2
+            
+lSkip2:
+        Next
+lSkip1:
+    
+        'if some node found - stitch it
+        If nodeMinDist > -1 Then
+            Call MergeNodes(k, nodeMinDist)
+        End If
+    
+        If (i And 255) = 0 Then
+            'show progress
+            Form1.Caption = "StitchNodes (" + CStr(bbox1.lat_min) + "," + CStr(bbox1.lon_min) + ";" + CStr(MaxDist) + ") " + CStr(i) + " / " + CStr(ChainNum): Form1.Refresh
+        End If
+    Next
+
+    
+End Sub
+
+'stitch internal borders between 1x1 degrees bboxes inside 5x5 degrees bbox
+Public Sub Stitch1x1from5x5(lat As Double, lon As Double, MaxDist As Double)
+    Dim bbox1 As bbox
+    Dim i As Long
+    For i = 1 To 4
+        bbox1.lat_min = lat + i
+        bbox1.lat_max = lat + i
+        bbox1.lon_min = lon
+        bbox1.lon_max = lon + 5
+        Call StitchNodes(bbox1, MaxDist)
+    Next
+
+    For i = 1 To 4
+        bbox1.lat_min = lat
+        bbox1.lat_max = lat + 5
+        bbox1.lon_min = lon + i
+        bbox1.lon_max = lon + i
+        Call StitchNodes(bbox1, MaxDist)
+    Next
 
 End Sub

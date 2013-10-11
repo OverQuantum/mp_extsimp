@@ -8,7 +8,7 @@ Begin VB.Form Form1
    LinkTopic       =   "Form1"
    ScaleHeight     =   765
    ScaleWidth      =   10005
-   StartUpPosition =   2  'CenterScreen
+   StartUpPosition =   3  'Windows Default
 End
 Attribute VB_Name = "Form1"
 Attribute VB_GlobalNameSpace = False
@@ -20,7 +20,7 @@ Attribute VB_Exposed = False
 ' Generalization of complex junctions and two ways roads
 ' from OpenStreetMap data
 '
-' Copyright © 2012 OverQuantum
+' Copyright © 2012-2013 OverQuantum
 '
 ' Please refer to mp_extsimp.bas for details
 '
@@ -29,7 +29,9 @@ Attribute VB_Exposed = False
 
 Option Explicit
 
-Private Sub Form_Activate()
+Private Sub Form_Load()
+    Form1.Visible = True 'display form
+    DoEvents
     Call OptimizeRouting(Command)
     End
 End Sub
